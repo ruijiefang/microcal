@@ -1,0 +1,523 @@
+#lang ivy1.8
+
+# This file models a microarchitecture of a secure processor that
+# only fetches non-secret values from memory into the cache.
+# 
+# To start, we first introduce some Ivy preliminaries. The `order` library 
+# gives an implementation of a linear order, which we use to model sequence
+# of natural numbers `N`. The linear order is implemented as a module named
+# `unbounded_sequence`, and has several actions associated with it:
+# `n.next()` --- returns the successor of number `n : unbounded_sequence`
+# `n.prev()` --- returns predecessor of number `n`
+# `0` --- least element in the order
+# The linear order implements a total order, with the following properties:
+# [transitivity]: forall T, U, V. T < U & U < V -> T < V
+# [antisymmetry]: forall T, U. ~(T < U & U < T)
+# [totality]: forall T, U. T < U | T = U | U < T
+#
+# The benefit of this datatype vis-a-vis SMT theories of arithmetic is that
+# it ensures all operations we do stay within the decidable fragment. Thus,
+# the cost imposed on Z3 will be mostly tractable.
+#
+# We will use the `unbounded_sequence` datatype to model structures such as
+# registers, program counters, and program addresses. Essentially, whenever
+# we need to use a number-like datatype, we will opt to use this instead,
+# to ensure decidability.
+include order
+
+# a bunch of instantiations of the `unbounded_sequence` module, for 
+# use in different places
+instance reg_id : unbounded_sequence
+instance lclock : unbounded_sequence 
+instance nat : unbounded_sequence 
+instance addr : unbounded_sequence 
+
+
+# Ivy also supports enumerated types. We use enumerated types to model things
+# like instruction kind, locations, secrecy levels, etc.
+
+# ternary type for deciding whether an instruction is the result of a speculation
+type ter = {tt, ff, unk}
+
+# op_type describes the instruction set
+type op_type = 
+    {
+        nop, beq, load, store, loadeq, storeq, reg_mut
+    }
+
+# loc_type describes the location of an instruction in the CPU's lifecycle.
+# the instruction starts in the issuing queue (l_prefetch), until it gets
+# prefetched into the ROB (l_rob), and then gets retired (if it is the 
+# result of a correct speculation) or aborted (if it is behind a mispredicted
+# branch). 
+type loc_type = 
+    {
+        l_prefetch, l_rob, l_retired, l_aborted
+    }
+
+# secrecy_level is a tag along each memory address,value pair describing
+# whether the (addr,val)-pair in memory is secret or not. Our goal is to prevent
+# secret values from being loaded into the cache. 
+type secrecy_level = {lvl_secret, lvl_public}
+
+# speculation_result describes the result of a speculation. For instance,
+# if the instruction
+# `beq r1, r2, pc1, pc2`
+# is speculated to be true, then we load the instruction at pc1 into
+# the ROB and the result will be tagged as `s_direction1`. Otherwise,
+# the result will be tagged as `s_direction2`.
+type speculation_result = {s_direction1, s_direction2} # forward, backward
+
+#####
+# Microarchitectural State
+#####
+
+# To recall our microarchitectural calculus, a Microarchitectural State
+# is defined by the tuple
+#
+#   > \Gamma = (\rho, M, C, O, PCs, R_{init}, R, s, P, \downarrow, L)
+#
+# where
+#  - \rho is the instruction stream
+#  - M is the memory
+#  - C is the cache
+#  - O is the ROB
+#  - PCs is the list of instruction indices to be prefetched
+#  - R_{init} is the initial register state and Rs is a sequence of register
+#     states for each instruction in the ROB
+#  - s, P, \downarrow describe speculation result and speculation resolution
+#  - L is a map that stores the secrecy level of each memory address.
+# We model each element of the tuple as Ivy modules next.
+
+# First, we consider modelling a register.
+# A register R has two payloads: value, which is modelled as a natural
+# number, and val_lvl, which tells us the secrecy level of the value.
+# The register has two actions: set_reg, which sets the value of a 
+# register, and probe_reg, which probes the value of a register.
+# 
+# The value inside the register is always 0-initialized.
+module register = {
+    individual value : nat 
+    individual val_lvl : secrecy_level 
+
+    after init {
+        value := 0;
+        val_lvl := lvl_public;
+    }
+
+    action set_reg(a: nat) = {
+        value := a;
+    }
+
+    after set_reg(a : nat) {
+        assert [after_set_reg] value = a;
+    }
+
+    action prob_reg returns (a:nat) = {
+        a := value;
+    }
+
+    after prob_reg returns (a: nat) {
+        assert [after_prob_reg] a = value;
+    }
+
+}
+
+# Next, we model memory. A memory consists of two parts:
+# > mem : addr -> nat is a map from addresses to values.
+# > lvl : addr -> secrecy_level is a map from addresses to secret level of an address.
+# Altogether, these two maps tell us the value and secrecy level of
+# a given address in memory. All values are 0-initialized in the beginning, but
+# the secrecy level of each address A is non-deterministically initialized.
+#
+# Each address a is associated with four actions:
+#  - `read`, `write` actions read from and write to the memory at address a.
+#  - `read_lvl`, `write_lvl` actions read or modify the secrecy level of memory at address a.
+#
+module memory = {
+    individual mem(A:addr) : nat
+    individual lvl(A:addr) : secrecy_level 
+    
+    after init {
+        mem(A) := 0;
+    }
+
+    action read(a:addr) returns (v:nat) = {
+        v := mem(a);
+    }
+
+    after read(a:addr) returns (v:nat) {
+        assert [mem_read_safe] v = mem(a);
+    }
+    
+    action read_lvl(a:addr) returns (l:secrecy_level) = {
+        l := lvl(a);
+    }
+
+    after read_lvl(a:addr) returns (l:secrecy_level) {
+        assert [mem_read_lvl_safe] l = lvl(a);
+    }
+
+    action write(a:addr,v:nat,l:secrecy_level) = {
+        mem(a) := v;
+        lvl(a) := l;
+    }
+
+    after write(a:addr,v:nat,l:secrecy_level) {
+        assert [write_safe] mem(a) = v;
+        assert [write_safe_lvl] lvl(a) = l;
+    }
+}
+
+# a register state is essentially a collection of
+# registers.
+module register_state = {
+    instance regs(R:reg_id) : register 
+    individual is_set : bool 
+    after init {
+        is_set := false;
+    }
+}
+
+# a memory_value module is a wrapper around a (addr, value)-pair
+# loaded from memory.
+module memory_value = {
+    individual load_val : nat 
+    individual load_addr : addr
+    individual loaded : bool 
+    individual seclevel : secrecy_level 
+    after init {
+        loaded := false;
+    }
+}
+
+# optional type that is a wrapper around 
+module optional(t) = {
+    instance v : t 
+    individual is_set : bool 
+    after init {
+        is_set := false;
+    }
+    action toggle = {
+        is_set := true;
+    }
+}
+
+# Next, we model the global state of the processor.
+# The following module describes an event, each event being an instruction.
+# We will use this module to model elements inside instruction streams and the ROB uniformly
+# where both instruction streams and the ROB are treated as a queue of events.
+module evs_type = {
+    # `op` describes the kind of instruction
+    individual op : op_type 
+
+    # book-keeping stuff
+    # where the event is located inside the processor
+    individual loc : loc_type 
+    # register state before this gets executed  
+    instance pre_regfile : optional(register_state)
+
+    # instruction-specific payloads
+    # there are several instructions we support, 
+    # their payloads are modelled here
+    # > nop
+    # > mut r 
+    # > beq r1, r2, pc1, pc2
+    # > load addr, r1
+    # > store r1, addr 
+    # > loadeq r1, r2, addr, r3 # built with beq+load payloads
+    # > storeq r1, r2, addr, r3 # built with beq+store payloads
+
+    # beq-specific payload; don't care otherwise
+    individual beq_reg0 : reg_id
+    individual beq_reg1 : reg_id 
+    individual beq_pc1 : nat 
+    individual beq_pc2 : nat 
+
+    # load-specific payload; don't care otherwise
+    individual load_addr : addr 
+    individual load_reg : reg_id
+    instantiate load_state : memory_value 
+
+    # store-specific payload; don't care otherwise
+    individual store_addr : addr 
+    individual store_reg : reg_id 
+    instantiate store_state : memory_value 
+
+    # reg_mut payload
+    individual reg_mut_id : reg_id 
+}
+
+# We can finally model the microarchitectural context \Gamma.
+# we call this context `ref` in the Ivy model, which stands for the
+# (global) reference. We use the Ivy `object` keyword to declare it,
+# meaning there is a single global instance maintained and there are
+# no multiple copies.
+object ref = {
+    # instruction stream 
+    instantiate evs(T:lclock) : evs_type 
+    
+    # globally shared memory and cache across all processor IDs.
+    # we could have adopted individual caches, but this would require
+    # the implementation of cache coherence protocol, which we will 
+    # try to avoid.
+    instantiate mem : memory 
+    instantiate cache : memory
+
+    # list of instruction indices to be prefetched next
+    individual can_be_prefetched(I:lclock) : bool 
+
+    ### speculation-specific data structures
+    # In our microarchitectural calculus, we chose to model the 
+    # branch speculation process using a somewhat convoluted setup;
+    # this is done by a triple (\downarrow, s, P) where \downarrow
+    # is the speculation relation, s denotes the most recent speculated
+    # instruction index, and P is the speculation map.
+    #
+    # This kind of reasoning makes the operational semantics rules 
+    # more easy to state, but sufficiently complicates decidable reasoning
+    # at the Ivy-level, mainly because we need to write quantified statements
+    # to detect whether an instruction is behind a mispredicted branch.
+    #
+    # To avoid the burden of reasoning about (\downarrow, s, P), we
+    # choose a different approach of maintaining a queue of booleans
+    # which are ghost variables that tell us (by the time of prediction)
+    # whether a branch is mispredicted. If a given instruction at index i
+    # is mispredicted, then _all_ its subsequent instructions fetched 
+    # into the ROB _will be_ marked as mispredicted in this queue.
+    #
+    # Then, at the branch-resolution time, we will tell the prefetcher
+    # to fetch the correct next instruction index into the ROB, and for
+    # these correctly speculated instructions, we will not set their 
+    # prediction value to false.
+    individual wrongly_speculated(T:lclock) : ter 
+
+    # additionally, need a separate field for each instruction marking
+    # whether an instruction is resolved or not.
+    individual resolved(T:lclock) : ter
+
+    # pending instructions are insturctions that are issued but 
+    # waiting to be prefetched. All pending instructions have location
+    # field set to l_prefetch
+    individual pending(T:lclock) : bool
+
+    # retired instructions are instructions that are committed.
+    # All retired instructions have location field set to l_retired
+    individual retired(T:lclock) : bool
+
+    # aborted instructions are those behind mispredicted branches
+    # they are thrown away by the instruction committer actions.
+    individual aborted(T:lclock) : bool 
+    individual in_rob(T:lclock) : bool
+
+    relation is_speculated(T:lclock)
+    definition is_speculated(T:lclock) = evs(T).op = beq | evs(T).op = loadeq | evs(T).op = storeq 
+
+    # lt is the clock of the instruction issuer
+    # each instruction has a unique index in the 
+    # instruction issuing stream, where the index
+    # is essentially it's issue time.
+    individual lt : lclock 
+
+    # fairness flags for liveness proofs
+    individual prefetch_fair : bool 
+    individual mark_prefetch_fair : bool 
+    individual issue_nop_fair : bool 
+    individual issue_reg_mut_fair : bool 
+    individual issue_beq_fair : bool 
+    individual issue_load_fair : bool 
+    individual issue_store_fair : bool 
+    individual issue_loadeq_fair : bool 
+    individual issue_storeq_fair : bool 
+    
+    # default invariants for fairness flags
+    invariant [fair0] ~prefetch_fair 
+    invariant [fair1] ~mark_prefetch_fair 
+    invariant [fair2] ~issue_nop_fair 
+    invariant [fair3] ~issue_reg_mut_fair
+    invariant [fair4] ~issue_beq_fair 
+    invariant [fair5] ~issue_load_fair 
+    invariant [fair6] ~issue_store_fair 
+    invariant [fair7] ~issue_loadeq_fair 
+    invariant [fair8] ~issue_storeq_fair 
+
+    after init {
+        lt := 0;
+        pending(T) := false;
+        in_rob(T) := false;
+        wrongly_speculated(T) := unk;
+        aborted(T) := false;
+        retired(T) := false;
+        can_be_prefetched(I) := false;
+        
+        # mark the first instruction in sequence
+        can_be_prefetched(0) := true;
+
+        # initialize register states non-deterministically
+        ref.evs(0).pre_regfile.toggle();
+        assert ref.evs(0).pre_regfile.is_set;
+
+        # fairness
+        prefetch_fair := false;
+        mark_prefetch_fair := false;
+        issue_nop_fair := false;
+        issue_reg_mut_fair := false;
+        issue_beq_fair := false;
+        issue_load_fair := false;
+        issue_store_fair := false;
+        issue_loadeq_fair := false;
+        issue_storeq_fair := false;
+    }
+
+    # obvious invariants
+    invariant [ob1] lt >= 0
+    invariant [ob2] forall T. T < lt -> (pending(T) | in_rob(T) | retired(T) | aborted(T)) 
+    invariant [ob3] ref.evs(0).pre_regfile.is_set 
+
+    ##
+    # actions for issuing commands
+    # these actions get non-deterministically
+    # called by ivy_check.
+
+    action issue_nop = {
+        issue_nop_fair := true;
+        issue_nop_fair := false;
+        var tt := lt;
+        pending(tt) := true;
+        evs(tt).op := nop;
+        evs(tt).loc := l_prefetch;
+        lt := lt.next;
+    }
+
+    action issue_reg_mut(r:reg_id) = {
+        issue_reg_mut_fair := true;
+        issue_reg_mut_fair := false;
+        var tt := lt;
+        pending(tt) := true;
+        evs(tt).op := reg_mut;
+        evs(tt).reg_mut_id := r;
+        evs(tt).loc := l_prefetch;
+        lt := lt.next;
+    }
+
+    action issue_load(r:reg_id, a:addr) = {
+        issue_load_fair := true;
+        issue_load_fair := false;
+        var tt := lt;
+        pending(tt) := true;
+        evs(tt).op := load;
+        evs(tt).load_reg := r;
+        evs(tt).load_addr := a;
+        evs(tt).loc := l_prefetch;
+        lt := lt.next;
+    }
+
+    action issue_store(a:addr, r:reg_id) = {
+        issue_store_fair := true;
+        issue_store_fair := false;
+        var tt := lt;
+        pending(tt) := true;
+        evs(tt).op := store;
+        evs(tt).store_reg := r;
+        evs(tt).store_addr := a;
+        evs(tt).loc := l_prefetch;
+        lt := lt.next;
+    }
+
+    action issue_beq(r0:reg_id, r1:reg_id, pc1:nat, pc2:nat) = {
+        issue_beq_fair := true;
+        issue_beq_fair := false;
+        var tt := lt;
+        pending(tt) := true;
+        evs(tt).op := beq;
+        evs(tt).beq_reg0 := r0;
+        evs(tt).beq_reg1 := r1;
+        evs(tt).beq_pc1 := pc1;
+        evs(tt).beq_pc2 := pc2;
+        evs(tt).loc := l_prefetch;
+        lt := lt.next;
+    }
+
+    action issue_loadeq(r0:reg_id, r1:reg_id, a:addr, r2:reg_id) = {
+        issue_loadeq_fair := true;
+        issue_loadeq_fair := false;
+        var tt := lt;
+        pending(tt) := true;
+        evs(tt).op := loadeq;
+        evs(tt).beq_reg0 := r0;
+        evs(tt).beq_reg1 := r1;
+        evs(tt).load_reg := r2;
+        evs(tt).load_addr := a;
+        evs(tt).loc := l_prefetch;
+        lt := lt.next;
+    }
+
+    action issue_storeq(r0:reg_id, r1:reg_id, a:addr, r2:reg_id) = {
+        issue_storeq_fair := true;
+        issue_storeq_fair := false;
+        var tt := lt;
+        pending(tt) := true;
+        evs(tt).op := storeq;
+        evs(tt).beq_reg0 := r0;
+        evs(tt).beq_reg1 := r1;
+        evs(tt).store_reg := r2;
+        evs(tt).store_addr := a;
+        evs(tt).loc := l_prefetch;
+        lt := lt.next;
+    }
+
+    action prefetch = {
+        prefetch_fair := true;
+        prefetch_fair := false;
+        if some tt:lclock. pending(tt) & can_be_prefetched(tt) minimizing tt {
+            assert evs(tt).loc = l_prefetch;
+            pending(tt) := false;
+            evs(tt).loc := l_rob;
+            in_rob(tt) := true;
+        }
+    }
+
+    action mark_prefetch = {
+        mark_prefetch_fair := true;
+        mark_prefetch_fair := false;
+        if some tt:lclock. in_rob(tt) & ~is_speculated(tt) {
+            if evs(tt).op = nop {
+                can_be_prefetched(tt.next) := true;
+            } else if evs(tt).op = reg_mut {
+                can_be_prefetched(tt.next) := true;
+            } else if evs(tt).op = load {
+                can_be_prefetched(tt.next) := true;
+            } else if evs(tt).op = store {
+                can_be_prefetched(tt.next) := true;
+            }
+        }
+    }
+    invariant [prefetch0] forall T. pending(T) -> evs(T).loc = l_prefetch 
+
+
+}
+
+##include semantics.ivy
+##include coherence.ivy
+##include invariants.ivy
+##include proofs.ivy
+
+#export register.set_reg
+#export register.prob_reg
+export ref.issue_nop
+#export ref.mem.read 
+#export ref.mem.write 
+#export ref.cache.read 
+#export ref.cache.write 
+
+
+export ref.issue_nop
+export ref.issue_reg_mut 
+export ref.issue_load 
+export ref.issue_store 
+export ref.issue_beq 
+export ref.issue_loadeq 
+export ref.issue_storeq 
+export ref.prefetch 
+export ref.mark_prefetch
+export ref.speculate 
